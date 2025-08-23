@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro">
+
+  <!--
+    name: 机器人模型名（本模板未直接使用）
+    namespace: 命名前缀，允许多个机器人在同一 ROS 网络中区分
+  -->
+  <xacro:macro name="denso_robot_srdf" params="name namespace">
+
+    <!-- GROUP -->
+    <group name="${namespace}arm">
+      <joint name="${namespace}joint_1"/>
+      <joint name="${namespace}joint_2"/>
+      <joint name="${namespace}joint_3"/>
+      <joint name="${namespace}joint_4"/>
+      <joint name="${namespace}joint_5"/>
+      <joint name="${namespace}joint_6"/>
+    </group>
+
+    <!-- GROUP STATE -->
+    <group_state name="home" group="${namespace}arm">
+      <joint name="${namespace}joint_1" value="0"/>
+      <joint name="${namespace}joint_2" value="0"/>
+      <joint name="${namespace}joint_3" value="0.331613"/>
+      <joint name="${namespace}joint_4" value="0"/>
+      <joint name="${namespace}joint_5" value="0"/>
+      <joint name="${namespace}joint_6" value="0"/>
+    </group_state>
+
+    <!-- VIRTUAL JOINT -->
+    <virtual_joint name="${namespace}fixed_base" type="fixed" parent_frame="world" child_link="${namespace}base_link" />
+
+    <!-- DISABLE COLLISIONS -->
+    <disable_collisions link1="${namespace}J6" link2="${namespace}J3" reason="Never"/>
+    <disable_collisions link1="${namespace}J6" link2="${namespace}J5" reason="Adjacent"/>
+    <disable_collisions link1="${namespace}J1" link2="${namespace}J2" reason="Adjacent"/>
+    <disable_collisions link1="${namespace}J1" link2="${namespace}base_link" reason="Adjacent"/>
+    <disable_collisions link1="${namespace}J2" link2="${namespace}J3" reason="Adjacent"/>
+    <disable_collisions link1="${namespace}J3" link2="${namespace}J4" reason="Adjacent"/>
+    <disable_collisions link1="${namespace}J3" link2="${namespace}J5" reason="Never"/>
+    <disable_collisions link1="${namespace}J4" link2="${namespace}J5" reason="Adjacent"/>
+
+  </xacro:macro>
+</robot>
+
