@@ -1,4 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/parameter_client.hpp>   // 保持你的头
 #include <std_msgs/msg/string.hpp>
 
 #include <sstream>
@@ -6,16 +7,18 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib> // std::strtod
+
+#include <Eigen/Geometry>
 
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <geometry_msgs/msg/pose.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/msg/joint_constraint.hpp>
+#include <moveit_msgs/msg/orientation_constraint.hpp>
+#include <moveit_msgs/msg/constraints.hpp>
 
 #include "insert_strategy.hpp"
-
-// 只需要关节约束相关的头
-#include <moveit_msgs/msg/joint_constraint.hpp>
-#include <moveit_msgs/msg/constraints.hpp>
 
 class RobotController : public rclcpp::Node {
 public:
@@ -35,8 +38,6 @@ public:
       move_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
           std::shared_ptr<rclcpp::Node>(this), "arm");
       RCLCPP_INFO(this->get_logger(), "MoveGroupInterface initialized successfully!");
-
-      // 打印运行时的规划组/参考系/末端，确认一致性
       printRuntimeFrames();
     } catch (const std::exception &e) {
       RCLCPP_ERROR(this->get_logger(), "Failed to initialize MoveGroupInterface: %s", e.what());
@@ -62,69 +63,76 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr command_sub_;
   uint32_t command_count_;
 
-  // 仅 J4 关节走廊：限制“路径上 J4 偏离当前角度不超过 tol_j4_rad”
-  // 注意：如果你的第4关节名字不是 "joint_4"（比如 "J4"），请把下面的 joint 名改成你实际的名字。
-  bool planPositionWithJ4Corridor(double x, double y, double z,
-                                  double tol_j4_rad)
+  // === 工具：向现有 path_constraints 里追加 Joint6 的 ±5° 走廊（以当前角度为中心）===
+  bool appendJ6Corridor(moveit_msgs::msg::Constraints& path_constraints, double tol_j6_rad)
   {
-    // 每次尝试都从“当前状态”起步
-    move_group_->setStartStateToCurrentState();
-
-    // 读取当前关节角（用于以当前 J4 为中心建“走廊”）
-    const std::vector<double> current_joints = move_group_->getCurrentJointValues();
-    if (current_joints.size() < 4) {
-      RCLCPP_ERROR(this->get_logger(), "Current joint vector has size %zu (<4).", current_joints.size());
+    const std::vector<double> joints = move_group_->getCurrentJointValues();
+    if (joints.size() < 6) {
+      RCLCPP_ERROR(this->get_logger(), "Cannot add J6 corridor: joint vector size %zu (<6).", joints.size());
       return false;
     }
-
-    moveit_msgs::msg::Constraints path_constraints;
-
-    moveit_msgs::msg::JointConstraint jcm;
-    jcm.joint_name = "joint_4";              // TODO: 如你的机器人是 "J4" 则改成 "J4"
-    jcm.position = current_joints[3];        // 以当前 J4 为中心
-    jcm.tolerance_above = tol_j4_rad;        // 上下容差相同
-    jcm.tolerance_below = tol_j4_rad;
-    jcm.weight = 1.0;
-    path_constraints.joint_constraints.push_back(jcm);
-
-    move_group_->setPathConstraints(path_constraints);
-
-    // 有路径约束会更慢，给足时间
-    move_group_->setPlanningTime(10.0);
-
-    // 仍然只给位置目标（姿态完全自由，J6 不再有任何约束）
-    move_group_->setPositionTarget(x, y, z);
-
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-    bool ok = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
-
-    if (ok) {
-      auto exec = move_group_->execute(plan);
-      ok = (exec == moveit::core::MoveItErrorCode::SUCCESS);
-    }
-
-    // 清掉约束，避免影响后续规划
-    move_group_->clearPathConstraints();
-    return ok;
+    moveit_msgs::msg::JointConstraint j6c;
+    j6c.joint_name = "joint_6"; // TODO: 若真实名称为 "J6"，请改这里
+    j6c.position = joints[5];   // 以“当前 J6”为中心
+    j6c.tolerance_above = tol_j6_rad;
+    j6c.tolerance_below = tol_j6_rad;
+    j6c.weight = 1.0;
+    path_constraints.joint_constraints.push_back(j6c);
+    return true;
   }
 
-  // ===== 统一的规划前设置 =====
+  // === 工具：生成“Z向下 + J4走廊”的约束（yaw 放宽到 π，避免卡住）===
+  moveit_msgs::msg::Constraints makeZDownConstraintWithJ4(double tol_j4_rad) {
+    moveit_msgs::msg::Constraints cons;
+
+    // J4 走廊（以当前角度为中心）
+    const auto joints = move_group_->getCurrentJointValues();
+    if (joints.size() >= 4) {
+      moveit_msgs::msg::JointConstraint j4;
+      j4.joint_name = "joint_4";           // TODO: 若真实名为 "J4" 请改这里
+      j4.position = joints[3];
+      j4.tolerance_above = tol_j4_rad;
+      j4.tolerance_below = tol_j4_rad;
+      j4.weight = 1.0;
+      cons.joint_constraints.push_back(j4);
+    } else {
+      RCLCPP_WARN(this->get_logger(), "[horizental] joint vector size < 4, skip J4 corridor.");
+    }
+
+    // 目标姿态：Z 对齐世界 -Z（roll=0, pitch=pi, yaw 任意）
+    Eigen::AngleAxisd Rz(0.0,            Eigen::Vector3d::UnitZ());
+    Eigen::AngleAxisd Ry(M_PI,           Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd Rx(0.0,            Eigen::Vector3d::UnitX());
+    Eigen::Quaterniond q_des = Rz * Ry * Rx;
+    q_des.normalize();
+
+    geometry_msgs::msg::Quaternion q_msg;
+    q_msg.x = q_des.x(); q_msg.y = q_des.y(); q_msg.z = q_des.z(); q_msg.w = q_des.w();
+
+    // OrientationConstraint：roll/pitch 严一些，yaw 放到 π（完全自由）
+    moveit_msgs::msg::OrientationConstraint oc;
+    oc.link_name = "J6";                 // 末端 link 名
+    oc.header.frame_id = "world";
+    oc.orientation = q_msg;
+    oc.absolute_x_axis_tolerance = 0.0349;  // ~2°
+    oc.absolute_y_axis_tolerance = 0.0349;  // ~2°
+    oc.absolute_z_axis_tolerance = M_PI;    // yaw 自由
+    oc.weight = 1.0;
+
+    cons.orientation_constraints.push_back(oc);
+    return cons;
+  }
+
+  // ===== 通用设置 =====
   void applyCommonSetup() {
-    // 清理上次的目标/约束，避免交叉影响
     move_group_->clearPathConstraints();
     move_group_->clearPoseTargets();
-
-    // 起点/末端/参考系：固定三件事
-    move_group_->setStartStateToCurrentState();   // 起点=当前状态
-    move_group_->setEndEffectorLink("J6");        // 你的末端执行器就是 J6
-    move_group_->setPoseReferenceFrame("world");  // 统一使用 world（如你习惯 base_link 可改之，但务必全程一致）
-
-    // 让行为更稳定接近 RViz
+    move_group_->setStartStateToCurrentState();
+    move_group_->setEndEffectorLink("J6");        // 若你的tip不同，请改
+    move_group_->setPoseReferenceFrame("world");  // 统一世界系
     move_group_->setPlannerId("RRTConnectkConfigDefault");
-    move_group_->setPlanningTime(3.0);
+    move_group_->setPlanningTime(10.0);
     move_group_->setNumPlanningAttempts(10);
-
-    // 温和的速度/加速度缩放（按需改）
     move_group_->setMaxVelocityScalingFactor(0.5);
     move_group_->setMaxAccelerationScalingFactor(0.5);
   }
@@ -136,17 +144,12 @@ private:
   }
 
   void waitForMoveGroup() {
-    // Wait for move_group node & params
     while (rclcpp::ok()) {
       auto node_names = this->get_node_names();
       bool move_group_found = false;
       for (const auto &name : node_names) {
-        if (name == "/move_group") {
-          move_group_found = true;
-          break;
-        }
+        if (name == "/move_group") { move_group_found = true; break; }
       }
-
       if (move_group_found) {
         RCLCPP_INFO(this->get_logger(), "move_group node found, checking parameters...");
         auto parameters_client =
@@ -166,7 +169,6 @@ private:
           }
         }
       }
-
       RCLCPP_INFO(this->get_logger(), "Waiting for move_group and parameters...");
       rclcpp::sleep_for(std::chrono::seconds(2));
     }
@@ -175,11 +177,9 @@ private:
   void copyParametersFromMoveGroup() {
     auto parameters_client =
         std::make_shared<rclcpp::SyncParametersClient>(this, "/move_group");
-
     try {
       auto params = parameters_client->get_parameters(
           {"robot_description", "robot_description_semantic"});
-
       if (params.size() >= 2) {
         this->declare_parameter("robot_description", params[0].as_string());
         this->declare_parameter("robot_description_semantic", params[1].as_string());
@@ -195,214 +195,140 @@ private:
   void printSupportedCommands() {
     RCLCPP_INFO(this->get_logger(), "Supported Command Formats:");
     RCLCPP_INFO(this->get_logger(),
-                "  pose <x> <y> <z>                  - Move to cartesian position (J4 corridor only)");
+                "  pose <x> <y> <z>                  - Move to cartesian position (J4 corridor only + J6 ±5°)");
     RCLCPP_INFO(this->get_logger(),
-                "  move <x> <y> <z>                  - Move to cartesian position (free orientation)");
+                "  move <x> <y> <z>                  - Move to cartesian position (free orientation + J6 ±5°)");
     RCLCPP_INFO(this->get_logger(),
-                "  joints <j1> <j2> ... <jN>         - Move to joint positions");
+                "  joints <j1> <j2> ... <jN>         - Move to joint positions (J6 ±5° corridor)");
     RCLCPP_INFO(this->get_logger(),
                 "  insert <distance> [percent] [joint|world] - Linear insertion");
     RCLCPP_INFO(this->get_logger(),
-                "       distance: meters (+ along +Z, - along -Z)");
+                "  horizental                      - Re-orient in place: tip faces world -Z (J4±45°, yaw free)");
     RCLCPP_INFO(this->get_logger(),
-                "       percent : 0~100 max velocity scaling (default 20)");
+                "  horizental orient|here          - Same as above");
     RCLCPP_INFO(this->get_logger(),
-                "       mode    : joint (J6 local Z, default) | world (world Z)");
+                "  horizental <x> <y> <z>          - Move to (x,y,z) with tip facing world -Z (J4±45°, yaw free)");
     RCLCPP_INFO(this->get_logger(),
-                "  current                           - Get current robot status");
+                "  horizental move <x> <y> <z>     - Same as above");
+    RCLCPP_INFO(this->get_logger(),
+                "  current                         - Get current robot status");
     RCLCPP_INFO(this->get_logger(), "========================================");
   }
 
-  void commandCallback(const std_msgs::msg::String::SharedPtr msg) {
-    command_count_++;
-    std::string command = msg->data;
+  // ====== pose/move/joints/insert 基础实现 ======
 
-    RCLCPP_INFO(this->get_logger(), "[Command #%d] Input received: '%s'", command_count_,
-                command.c_str());
-
-    std::istringstream iss(command);
-    std::string type;
-    iss >> type;
-
-    if (type.empty()) {
-      RCLCPP_WARN(this->get_logger(), "Empty command received");
-      return;
-    }
-
-    RCLCPP_INFO(this->get_logger(), "Command parsed successfully, type: '%s'", type.c_str());
-    RCLCPP_INFO(this->get_logger(), "Starting control execution...");
-
-    auto start_time = this->get_clock()->now();
-
-    if (type == "pose") {
-      double x, y, z;
-      if (iss >> x >> y >> z) {
-        moveToPose(x, y, z);
-      } else {
-        RCLCPP_ERROR(this->get_logger(), "Invalid pose parameters. Expected: pose <x> <y> <z>");
-      }
-    } else if (type == "joints") {
-      std::vector<double> joints;
-      double val;
-      while (iss >> val) {
-        joints.push_back(val);
-      }
-      if (!joints.empty()) {
-        moveToJoints(joints);
-      } else {
-        RCLCPP_ERROR(this->get_logger(),
-                     "No joint values provided. Expected: joints <j1> <j2> ... <jN>");
-      }
-    } else if (type == "insert") {
-      double dz;
-      double percent = 20.0; // default 20%
-      std::string mode = "joint";
-      if (iss >> dz) {
-        if (iss >> percent) {
-          // optional
-        }
-        if (iss >> mode) {
-          // optional
-        }
-        // sanitize
-        if (!(percent > 0.0 && percent <= 100.0)) {
-          RCLCPP_ERROR(this->get_logger(),
-                       "Invalid percent %.1f (valid range 0~100].", percent);
-          return;
-        }
-        if (mode != "joint" && mode != "world") {
-          RCLCPP_WARN(this->get_logger(),
-                      "Unknown mode '%s', fallback to 'joint'.", mode.c_str());
-          mode = "joint";
-        }
-
-        RCLCPP_INFO(this->get_logger(),
-                    "Insert request: distance=%.4f m, percent=%.1f%%, mode=%s",
-                    dz, percent, mode.c_str());
-
-        move_group_->setMaxVelocityScalingFactor(std::min(1.0, std::max(0.01, percent / 100.0)));
-        move_group_->setMaxAccelerationScalingFactor(
-            std::min(1.0, std::max(0.01, percent / 100.0)));
-
-        bool ok = InsertStrategy::execute(*move_group_, this->get_logger(), dz, percent, mode);
-        if (!ok) {
-          if (mode == "joint") {
-            RCLCPP_WARN(this->get_logger(),
-                        "Insert (joint Z) failed, trying fallback along world Z...");
-          } else {
-            RCLCPP_WARN(this->get_logger(),
-                        "Insert (world Z) failed, trying simple cartesian fallback...");
-          }
-          insertAlongWorldZ(dz, percent);
-        }
-      } else {
-        RCLCPP_ERROR(this->get_logger(),
-                     "Invalid insert parameter. Expected: insert <distance> [percent] [joint|world]");
-      }
-    } else if (type == "move") {
-      double x, y, z;
-      if (iss >> x >> y >> z) {
-        moveToPosition(x, y, z);
-      } else {
-        RCLCPP_ERROR(this->get_logger(), "Invalid move parameters. Expected: move <x> <y> <z>");
-      }
-    } else if (type == "current" || type == "status") {
-      getCurrentStatus();
-    } else {
-      RCLCPP_ERROR(this->get_logger(), "Unknown command type: '%s'", type.c_str());
-      RCLCPP_INFO(this->get_logger(), "Use one of: pose, move, joints, insert, current");
-    }
-
-    auto end_time = this->get_clock()->now();
-    auto duration = end_time - start_time;
-    RCLCPP_INFO(this->get_logger(), "Command #%d execution time: %.2f seconds", command_count_,
-                duration.seconds());
-    RCLCPP_INFO(this->get_logger(), "========================================");
-  }
-
-  // ===== pose：只给位置 + 仅 J4 路径约束（逐步放宽）=====
-  void moveToPose(double x, double y, double z) {
-    applyCommonSetup();  // 统一设置（起点/EEF/参考系/规划器等）
-
-    RCLCPP_INFO(this->get_logger(), "Setting target position with J4 corridor only...");
-    move_group_->getCurrentState(10.0);
-
-    // 递增放宽 J4 走廊（单位：弧度）
-    const std::vector<double> tol_j4_list = {0.17, 0.35, 0.52, 0.87};  // 10°, 20°, 30°, 50°
-    bool done = false;
-
-    for (double tol_j4 : tol_j4_list) {
-      RCLCPP_INFO(this->get_logger(), "Trying J4 corridor: %.1f deg", tol_j4 * 180.0 / M_PI);
-      if (planPositionWithJ4Corridor(x, y, z, tol_j4)) {
-        done = true;
-        break;
-      }
-      RCLCPP_WARN(this->get_logger(), "Plan failed with J4 corridor=%.1f deg, relaxing...",
-                  tol_j4 * 180.0 / M_PI);
-    }
-
-    if (!done) {
-      // 兜底：完全不加约束（提示：此时 J4 可能会动得多）
-      RCLCPP_WARN(this->get_logger(), "Fallback: no J4 constraint (may rotate J4 freely).");
-      move_group_->setPositionTarget(x, y, z);
-      moveit::planning_interface::MoveGroupInterface::Plan plan;
-      bool plan_success = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
-      if (plan_success) {
-        auto exec = move_group_->execute(plan);
-        if (exec == moveit::core::MoveItErrorCode::SUCCESS) {
-          done = true;
-        } else {
-          RCLCPP_ERROR(this->get_logger(), "Execution failed in fallback!");
-        }
-      } else {
-        RCLCPP_ERROR(this->get_logger(), "Planning failed in fallback!");
-      }
-    }
-
-    if (done) {
-      auto final_pose = move_group_->getCurrentPose("J6").pose;
-      RCLCPP_INFO(this->get_logger(), "Final position: (%.3f, %.3f, %.3f)",
-                  final_pose.position.x, final_pose.position.y, final_pose.position.z);
-      RCLCPP_INFO(this->get_logger(), "Final orientation: (%.3f, %.3f, %.3f, %.3f)",
-                  final_pose.orientation.x, final_pose.orientation.y,
-                  final_pose.orientation.z, final_pose.orientation.w);
-    }
-
-    move_group_->stop();
-    move_group_->clearPoseTargets();
-  }
-
-  // move：保留“完全自由”的位置目标
   void moveToPosition(double x, double y, double z) {
-    applyCommonSetup();  // 统一设置
-
-    RCLCPP_INFO(this->get_logger(), "Setting target position (free orientation)...");
+    applyCommonSetup();
+    RCLCPP_INFO(this->get_logger(), "Setting target position (free orientation, with J6 corridor ±5°)...");
     move_group_->getCurrentState(10.0);
+
+    // 添加 J6 走廊（±5°）
+    moveit_msgs::msg::Constraints path_constraints;
+    appendJ6Corridor(path_constraints, 5.0 * M_PI / 180.0);
+    move_group_->setPathConstraints(path_constraints);
 
     move_group_->setPlanningTime(20.0);
     move_group_->setNumPlanningAttempts(15);
-    move_group_->setGoalTolerance(0.01);
-
+    move_group_->setGoalTolerance(0.01); // ~1cm
     move_group_->setPositionTarget(x, y, z);
 
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     bool plan_success = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
-
     if (plan_success) {
       auto exec_res = move_group_->execute(plan);
-      if (exec_res == moveit::core::MoveItErrorCode::SUCCESS) {
-        RCLCPP_INFO(this->get_logger(), "Position motion completed successfully!");
-        auto final_pose = move_group_->getCurrentPose("J6").pose;
-        RCLCPP_INFO(this->get_logger(), "Final position: (%.3f, %.3f, %.3f)",
-                    final_pose.position.x, final_pose.position.y, final_pose.position.z);
-        RCLCPP_INFO(this->get_logger(), "Final orientation: (%.3f, %.3f, %.3f, %.3f)",
-                    final_pose.orientation.x, final_pose.orientation.y,
-                    final_pose.orientation.z, final_pose.orientation.w);
-      } else {
+      if (exec_res != moveit::core::MoveItErrorCode::SUCCESS) {
         RCLCPP_ERROR(this->get_logger(), "Motion execution failed!");
       }
     } else {
       RCLCPP_ERROR(this->get_logger(), "Position-only planning failed!");
+    }
+
+    move_group_->clearPathConstraints();   // 清理
+    move_group_->stop();
+    move_group_->clearPoseTargets();
+  }
+
+  bool planPositionWithJ4Corridor(double x, double y, double z, double tol_j4_rad) {
+    move_group_->setStartStateToCurrentState();
+
+    const std::vector<double> current_joints = move_group_->getCurrentJointValues();
+    if (current_joints.size() < 4) {
+      RCLCPP_ERROR(this->get_logger(), "Current joint vector size %zu (<4).", current_joints.size());
+      return false;
+    }
+
+    moveit_msgs::msg::Constraints path_constraints;
+
+    // J4 走廊
+    moveit_msgs::msg::JointConstraint jcm;
+    jcm.joint_name = "joint_4";      // TODO: 若真实名称为 "J4" 请改这里
+    jcm.position = current_joints[3];
+    jcm.tolerance_above = tol_j4_rad;
+    jcm.tolerance_below = tol_j4_rad;
+    jcm.weight = 1.0;
+    path_constraints.joint_constraints.push_back(jcm);
+
+    // J6 走廊（±5°）
+    appendJ6Corridor(path_constraints, 5.0 * M_PI / 180.0);
+
+    move_group_->setPathConstraints(path_constraints);
+
+    move_group_->setPlanningTime(10.0);
+    move_group_->setGoalPositionTolerance(0.01);
+    move_group_->setGoalOrientationTolerance(0.01745);
+    move_group_->setPositionTarget(x, y, z);
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool ok = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    if (ok) {
+      auto exec = move_group_->execute(plan);
+      ok = (exec == moveit::core::MoveItErrorCode::SUCCESS);
+    } else {
+      RCLCPP_ERROR(this->get_logger(), "Planning failed under J4 corridor.");
+    }
+
+    move_group_->clearPathConstraints();   // 清理
+    move_group_->clearPoseTargets();
+    return ok;
+  }
+
+  void moveToPose(double x, double y, double z) {
+    applyCommonSetup();
+    RCLCPP_INFO(this->get_logger(), "Setting target position with J4 corridor only (+ J6 ±5°)...");
+    move_group_->getCurrentState(10.0);
+
+    const std::vector<double> tol_j4_list = {0.17, 0.35, 0.52, 0.87};  // 10°,20°,30°,50°
+    bool done = false;
+
+    for (double tol_j4 : tol_j4_list) {
+      RCLCPP_INFO(this->get_logger(), "Trying J4 corridor: %.1f deg", tol_j4 * 180.0 / M_PI);
+      if (planPositionWithJ4Corridor(x, y, z, tol_j4)) { done = true; break; }
+      RCLCPP_WARN(this->get_logger(), "Plan failed with corridor=%.1f deg, relaxing...",
+                  tol_j4 * 180.0 / M_PI);
+    }
+
+    if (!done) {
+      RCLCPP_WARN(this->get_logger(), "Fallback: no J4 constraint (but keep J6 ±5°).");
+      // 仅加 J6 走廊
+      moveit_msgs::msg::Constraints path_constraints;
+      appendJ6Corridor(path_constraints, 5.0 * M_PI / 180.0);
+      move_group_->setPathConstraints(path_constraints);
+
+      move_group_->setPositionTarget(x, y, z);
+      move_group_->setGoalPositionTolerance(0.01);
+      move_group_->setGoalOrientationTolerance(0.01745);
+
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      bool plan_success = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+      if (plan_success) {
+        auto exec = move_group_->execute(plan);
+        if (exec != moveit::core::MoveItErrorCode::SUCCESS)
+          RCLCPP_ERROR(this->get_logger(), "Execution failed in fallback!");
+      } else {
+        RCLCPP_ERROR(this->get_logger(), "Planning failed in fallback!");
+      }
+
+      move_group_->clearPathConstraints(); // 清理
     }
 
     move_group_->stop();
@@ -410,33 +336,37 @@ private:
   }
 
   void moveToJoints(const std::vector<double> &joints) {
-    applyCommonSetup();  // 统一设置
-
-    RCLCPP_INFO(this->get_logger(), "Setting target joint positions...");
-    auto current_joints = move_group_->getCurrentJointValues();
-    for (size_t i = 0; i < current_joints.size() && i < joints.size(); ++i) {
-      double diff = joints[i] - current_joints[i];
-      RCLCPP_INFO(this->get_logger(), "  Joint %zu: %.3f -> %.3f (delta %.3f rad)", i + 1,
-                  current_joints[i], joints[i], diff);
-    }
+    applyCommonSetup();
+    RCLCPP_INFO(this->get_logger(), "Setting target joint positions (with J6 corridor ±5°)...");
+    // 添加 J6 走廊（±5°）
+    moveit_msgs::msg::Constraints path_constraints;
+    appendJ6Corridor(path_constraints, 5.0 * M_PI / 180.0);
+    move_group_->setPathConstraints(path_constraints);
 
     move_group_->setJointValueTarget(joints);
-    bool success = static_cast<bool>(move_group_->move());
-    if (success) {
-      RCLCPP_INFO(this->get_logger(), "Joint motion completed successfully!");
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool plan_success = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    if (plan_success) {
+      (void)move_group_->execute(plan);
     } else {
-      RCLCPP_ERROR(this->get_logger(), "Joint motion failed!");
+      RCLCPP_ERROR(this->get_logger(), "Joint planning failed!");
     }
+
+    move_group_->clearPathConstraints(); // 清理
   }
 
-  // Fallback: world/base frame Z 方向直线插补（保持之前实现）
   void insertAlongWorldZ(double dz, double percent) {
-    applyCommonSetup();  // 统一设置
-
+    applyCommonSetup();
     RCLCPP_INFO(this->get_logger(),
-                "Fallback: Cartesian path along WORLD Z, dz=%.4f m (%.1f%%)", dz, percent);
+                "Fallback: Cartesian path along WORLD Z, dz=%.4f m (%.1f%%) with J6 corridor ±5°",
+                dz, percent);
 
-    // 速度/加速度缩放
+    // 添加 J6 走廊（±5°）——注意：computeCartesianPath 通常不会应用 path constraints
+    moveit_msgs::msg::Constraints path_constraints;
+    appendJ6Corridor(path_constraints, 5.0 * M_PI / 180.0);
+    move_group_->setPathConstraints(path_constraints);
+
     double scale = std::min(1.0, std::max(0.01, percent / 100.0));
     move_group_->setMaxVelocityScalingFactor(scale);
     move_group_->setMaxAccelerationScalingFactor(scale);
@@ -462,9 +392,7 @@ private:
       moveit::planning_interface::MoveGroupInterface::Plan plan;
       plan.trajectory_ = trajectory;
       auto exec_res = move_group_->execute(plan);
-      if (exec_res == moveit::core::MoveItErrorCode::SUCCESS) {
-        RCLCPP_INFO(this->get_logger(), "Linear insertion (world Z) executed successfully!");
-      } else {
+      if (exec_res != moveit::core::MoveItErrorCode::SUCCESS) {
         RCLCPP_ERROR(this->get_logger(), "Execution failed for world-Z insertion!");
       }
     } else {
@@ -472,62 +400,170 @@ private:
                    "Cartesian path planning failed (world Z). Only %.1f%% planned.",
                    fraction * 100.0);
     }
+
+    move_group_->clearPathConstraints(); // 清理
   }
 
   void getCurrentStatus() {
     RCLCPP_INFO(this->get_logger(), "=== ROBOT CURRENT STATUS ===");
-
     try {
       move_group_->getCurrentState(10.0);
-
       auto current_pose = move_group_->getCurrentPose("J6").pose;
-      RCLCPP_INFO(this->get_logger(), "Current End-Effector Position:");
-      RCLCPP_INFO(this->get_logger(), "  X: %.4f m", current_pose.position.x);
-      RCLCPP_INFO(this->get_logger(), "  Y: %.4f m", current_pose.position.y);
-      RCLCPP_INFO(this->get_logger(), "  Z: %.4f m", current_pose.position.z);
-
-      RCLCPP_INFO(this->get_logger(), "Current Orientation (Quaternion):");
-      RCLCPP_INFO(this->get_logger(), "  X: %.4f", current_pose.orientation.x);
-      RCLCPP_INFO(this->get_logger(), "  Y: %.4f", current_pose.orientation.y);
-      RCLCPP_INFO(this->get_logger(), "  Z: %.4f", current_pose.orientation.z);
-      RCLCPP_INFO(this->get_logger(), "  W: %.4f", current_pose.orientation.w);
-
-      auto current_joints = move_group_->getCurrentJointValues();
-      RCLCPP_INFO(this->get_logger(), "Current Joint Positions (rad):");
-      for (size_t i = 0; i < current_joints.size(); ++i) {
-        RCLCPP_INFO(this->get_logger(), "  Joint %zu: %.4f", i + 1, current_joints[i]);
-      }
-
-      double x = current_pose.position.x;
-      double y = current_pose.position.y;
-      double z = current_pose.position.z;
-
-      RCLCPP_INFO(this->get_logger(), "=== SUGGESTED NEARBY TARGETS ===");
-      RCLCPP_INFO(this->get_logger(), "  pose %.3f %.3f %.3f  (move +5cm in X)", x + 0.05, y, z);
-      RCLCPP_INFO(this->get_logger(), "  pose %.3f %.3f %.3f  (move -5cm in X)", x - 0.05, y, z);
-      RCLCPP_INFO(this->get_logger(), "  pose %.3f %.3f %.3f  (move +5cm in Y)", x, y + 0.05, z);
-      RCLCPP_INFO(this->get_logger(), "  pose %.3f %.3f %.3f  (move -5cm in Y)", x, y - 0.05, z);
-      RCLCPP_INFO(this->get_logger(), "  pose %.3f %.3f %.3f  (move +5cm in Z)", x, y, z + 0.05);
-      RCLCPP_INFO(this->get_logger(), "  pose %.3f %.3f %.3f  (move -5cm in Z)", x, y, z - 0.05);
-
-      RCLCPP_INFO(this->get_logger(), "Insert examples:");
-      RCLCPP_INFO(this->get_logger(), "  insert 0.02           (20%%, joint Z default)");
-      RCLCPP_INFO(this->get_logger(), "  insert 0.02 30 joint  (30%%, joint Z)");
-      RCLCPP_INFO(this->get_logger(), "  insert 0.02 20 world  (20%%, world Z)");
-
+      RCLCPP_INFO(this->get_logger(), "Pos: (%.4f, %.4f, %.4f)",
+                  current_pose.position.x, current_pose.position.y, current_pose.position.z);
+      RCLCPP_INFO(this->get_logger(), "Quat: (%.4f, %.4f, %.4f, %.4f)",
+                  current_pose.orientation.x, current_pose.orientation.y,
+                  current_pose.orientation.z, current_pose.orientation.w);
     } catch (const std::exception &e) {
       RCLCPP_ERROR(this->get_logger(), "Failed to get current status: %s", e.what());
     }
-
     RCLCPP_INFO(this->get_logger(), "========================");
+  }
+
+  // ====== 新增：horizental（使用 Z-down 约束 + J4 走廊，且不再限制 J6±5°） ======
+
+  bool horizentalOrientHere() {
+    applyCommonSetup();
+    auto cur = move_group_->getCurrentPose("J6").pose;
+
+    const double tol_j4 = 45.0 * M_PI / 180.0;
+    moveit_msgs::msg::Constraints cons = makeZDownConstraintWithJ4(tol_j4);
+    move_group_->setPathConstraints(cons);
+
+    // 固定位置在当前点，姿态靠 OrientationConstraint 限制
+    move_group_->setPositionTarget(cur.position.x, cur.position.y, cur.position.z);
+    move_group_->setGoalPositionTolerance(0.002);       // ~2mm
+    move_group_->setGoalOrientationTolerance(0.01745);  // ~1°（帮助 IK 收敛）
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool ok = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    if (!ok) {
+      RCLCPP_ERROR(this->get_logger(), "[horizental] orient-here planning failed.");
+      move_group_->clearPathConstraints();
+      move_group_->clearPoseTargets();
+      return false;
+    }
+
+    auto exec_ok = (move_group_->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    move_group_->clearPathConstraints();
+    move_group_->clearPoseTargets();
+    return exec_ok;
+  }
+
+  bool horizentalMoveTo(double x, double y, double z) {
+    applyCommonSetup();
+
+    const double tol_j4 = 45.0 * M_PI / 180.0;
+    moveit_msgs::msg::Constraints cons = makeZDownConstraintWithJ4(tol_j4);
+    move_group_->setPathConstraints(cons);
+
+    move_group_->setPositionTarget(x, y, z);
+    move_group_->setGoalPositionTolerance(0.002);       // ~2mm
+    move_group_->setGoalOrientationTolerance(0.01745);  // ~1°
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool ok = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    if (!ok) {
+      RCLCPP_ERROR(this->get_logger(), "[horizental] move planning failed.");
+      move_group_->clearPathConstraints();
+      move_group_->clearPoseTargets();
+      return false;
+    }
+
+    auto exec_ok = (move_group_->execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+    move_group_->clearPathConstraints();
+    move_group_->clearPoseTargets();
+    return exec_ok;
+  }
+
+  // ====== 命令解析 ======
+  void commandCallback(const std_msgs::msg::String::SharedPtr msg) {
+    command_count_++;
+    std::string command = msg->data;
+
+    RCLCPP_INFO(this->get_logger(), "[Command #%d] Input received: '%s'",
+                command_count_, command.c_str());
+
+    std::istringstream iss(command);
+    std::string type; iss >> type;
+    if (type.empty()) { RCLCPP_WARN(this->get_logger(), "Empty command"); return; }
+
+    RCLCPP_INFO(this->get_logger(), "Command parsed: '%s'", type.c_str());
+    RCLCPP_INFO(this->get_logger(), "Starting control execution...");
+
+    auto start_time = this->get_clock()->now();
+
+    if (type == "pose") {
+      double x,y,z; if (iss >> x >> y >> z) moveToPose(x,y,z);
+      else RCLCPP_ERROR(this->get_logger(), "Expected: pose <x> <y> <z>");
+    }
+    else if (type == "move") {
+      double x,y,z; if (iss >> x >> y >> z) moveToPosition(x,y,z);
+      else RCLCPP_ERROR(this->get_logger(), "Expected: move <x> <y> <z>");
+    }
+    else if (type == "joints") {
+      std::vector<double> joints; double v; while (iss >> v) joints.push_back(v);
+      if (!joints.empty()) moveToJoints(joints);
+      else RCLCPP_ERROR(this->get_logger(), "Expected: joints <j1> <j2> ...");
+    }
+    else if (type == "insert") {
+      double dz; double percent = 20.0; std::string mode = "joint";
+      if (iss >> dz) { (void)(iss >> percent); (void)(iss >> mode);
+        if (!(percent > 0.0 && percent <= 100.0)) {
+          RCLCPP_ERROR(this->get_logger(),"Invalid percent %.1f", percent);
+        } else {
+          move_group_->setMaxVelocityScalingFactor(std::min(1.0, std::max(0.01, percent/100.0)));
+          move_group_->setMaxAccelerationScalingFactor(std::min(1.0, std::max(0.01, percent/100.0)));
+          bool ok = InsertStrategy::execute(*move_group_, this->get_logger(), dz, percent, mode);
+          if (!ok) { RCLCPP_ERROR(this->get_logger(), "Insert failed."); }
+        }
+      } else RCLCPP_ERROR(this->get_logger(),
+                          "Expected: insert <distance> [percent] [joint|world]");
+    }
+    else if (type == "horizental") {
+      std::string token; double x,y,z;
+      if (!(iss >> token)) {
+        if (!horizentalOrientHere()) RCLCPP_ERROR(this->get_logger(), "horizental failed.");
+      } else if (token == "orient" || token == "here") {
+        if (!horizentalOrientHere()) RCLCPP_ERROR(this->get_logger(), "horizental orient failed.");
+      } else if (token == "move") {
+        if (iss >> x >> y >> z) {
+          if (!horizentalMoveTo(x,y,z)) RCLCPP_ERROR(this->get_logger(), "horizental move failed.");
+        } else {
+          RCLCPP_ERROR(this->get_logger(), "Expected: horizental move <x> <y> <z>");
+        }
+      } else {
+        char* endptr=nullptr; double maybe_x = std::strtod(token.c_str(), &endptr);
+        if (endptr && *endptr=='\0') {
+          x = maybe_x;
+          if (iss >> y >> z) {
+            if (!horizentalMoveTo(x,y,z)) RCLCPP_ERROR(this->get_logger(), "horizental <x y z> failed.");
+          } else {
+            RCLCPP_ERROR(this->get_logger(), "Expected: horizental <x> <y> <z>");
+          }
+        } else {
+          RCLCPP_ERROR(this->get_logger(), "Unknown subcommand for 'horizental': %s", token.c_str());
+        }
+      }
+    }
+    else if (type == "current" || type == "status") {
+      getCurrentStatus();
+    }
+    else {
+      RCLCPP_ERROR(this->get_logger(), "Unknown command: '%s'", type.c_str());
+      RCLCPP_INFO(this->get_logger(), "Use one of: pose, move, joints, insert, horizental, current");
+    }
+
+    auto end_time = this->get_clock()->now();
+    auto duration = end_time - start_time;
+    RCLCPP_INFO(this->get_logger(), "Command #%d execution time: %.2f s",
+                command_count_, duration.seconds());
+    RCLCPP_INFO(this->get_logger(), "========================================");
   }
 };
 
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
-
-  RCLCPP_INFO(rclcpp::get_logger("main"), "Starting Robot Controller Node...");
-
   try {
     auto node = std::make_shared<RobotController>();
     rclcpp::spin(node);
@@ -535,8 +571,6 @@ int main(int argc, char **argv) {
     RCLCPP_FATAL(rclcpp::get_logger("main"), "Fatal error: %s", e.what());
     return 1;
   }
-
-  RCLCPP_INFO(rclcpp::get_logger("main"), "Robot Controller Node shutting down...");
   rclcpp::shutdown();
   return 0;
 }
